@@ -2,7 +2,6 @@ import { Boom } from '@hapi/boom'
 import NodeCache from 'node-cache'
 import readline from 'readline'
 import makeWASocket, { AnyMessageContent, BinaryInfo, delay, DisconnectReason, downloadAndProcessHistorySyncNotification, encodeWAM, fetchLatestBaileysVersion, getAggregateVotesInPollMessage, getHistoryMsg, isJidNewsletter, makeCacheableSignalKeyStore, makeInMemoryStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
-//import MAIN_LOGGER from '../src/Utils/logger'
 import open from 'open'
 import fs from 'fs'
 import P from 'pino'
@@ -14,21 +13,16 @@ const useStore = !process.argv.includes('--no-store')
 const doReplies = process.argv.includes('--do-reply')
 const usePairingCode = process.argv.includes('--use-pairing-code')
 
-// external map to store retry counts of messages when decryption/encryption fails
-// keep this out of the socket itself, so as to prevent a message decryption/encryption loop across socket restarts
 const msgRetryCounterCache = new NodeCache()
 
 const onDemandMap = new Map<string, string>()
 
-// Read line interface
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
 const question = (text: string) => new Promise<string>((resolve) => rl.question(text, resolve))
 
-// the store maintains the data of the WA connection in memory
-// can be written out to a file & read from it
 const store = useStore ? makeInMemoryStore({ logger }) : undefined
 store?.readFromFile('./baileys_store_multi.json')
-// save every 10s
+
 setInterval(() => {
 	store?.writeToFile('./baileys_store_multi.json')
 }, 10_000)
@@ -36,7 +30,7 @@ setInterval(() => {
 // start a connection
 const startSock = async() => {
 	const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info')
-	// fetch latest version of WA Web
+
 	const { version, isLatest } = await fetchLatestBaileysVersion()
 	console.log(`using WA v${version.join('.')}, isLatest: ${isLatest}`)
 
@@ -46,23 +40,16 @@ const startSock = async() => {
 		printQRInTerminal: !usePairingCode,
 		auth: {
 			creds: state.creds,
-			/** caching makes the store faster to send/recv messages */
 			keys: makeCacheableSignalKeyStore(state.keys, logger),
 		},
 		msgRetryCounterCache,
 		generateHighQualityLinkPreview: true,
-		// ignore all broadcast messages -- to receive the same
-		// comment the line below out
-		// shouldIgnoreJid: jid => isJidBroadcast(jid),
-		// implement to handle retries & poll updates
 		getMessage,
 	})
 
 	store?.bind(sock.ev)
 
-	// Pairing code for Web clients
 	if (usePairingCode && !sock.authState.creds.registered) {
-		// todo move to QR event
 		const phoneNumber = await question('Please enter your phone number:\n')
 		const code = await sock.requestPairingCode(phoneNumber)
 		console.log(`Pairing code: ${code}`)
@@ -80,13 +67,9 @@ const startSock = async() => {
 		await sock.sendMessage(jid, msg)
 	}
 
-	// the process function lets you process all events that just occurred
-	// efficiently in a batch
+
 	sock.ev.process(
-		// events is a map for event name => event data
 		async(events) => {
-			// something about the connection changed
-			// maybe it closed, or we received all offline message or connection opened
 			if(events['connection.update']) {
 				const update = events['connection.update']
 				const { connection, lastDisconnect } = update
@@ -99,16 +82,8 @@ const startSock = async() => {
 					}
 				}
 				
-				// WARNING: THIS WILL SEND A WAM EXAMPLE AND THIS IS A ****CAPTURED MESSAGE.****
-				// DO NOT ACTUALLY ENABLE THIS UNLESS YOU MODIFIED THE FILE.JSON!!!!!
-				// THE ANALYTICS IN THE FILE ARE OLD. DO NOT USE THEM.
-				// YOUR APP SHOULD HAVE GLOBALS AND ANALYTICS ACCURATE TO TIME, DATE AND THE SESSION
-				// THIS FILE.JSON APPROACH IS JUST AN APPROACH I USED, BE FREE TO DO THIS IN ANOTHER WAY.
-				// THE FIRST EVENT CONTAINS THE CONSTANT GLOBALS, EXCEPT THE seqenceNumber(in the event) and commitTime
-				// THIS INCLUDES STUFF LIKE ocVersion WHICH IS CRUCIAL FOR THE PREVENTION OF THE WARNING
 				const sendWAMExample = false;
 				if(connection === 'open' && sendWAMExample) {
-					/// sending WAM EXAMPLE
 					const {
 						header: {
 							wamVersion,
@@ -132,7 +107,6 @@ const startSock = async() => {
 				console.log('connection update', update)
 			}
 
-			// credentials updated -- save them
 			if(events['creds.update']) {
 				await saveCreds()
 			}
@@ -150,7 +124,6 @@ const startSock = async() => {
 				console.log('recv call event', events.call)
 			}
 
-			// history received
 			if(events['messaging-history.set']) {
 				const { chats, contacts, messages, isLatest, progress, syncType } = events['messaging-history.set']
 				if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
@@ -159,53 +132,13 @@ const startSock = async() => {
 				console.log(`recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`)
 			}
 
-			// received a new message
 			if(events['messages.upsert']) {
 				const upsert = events['messages.upsert']
 				console.log('recv messages ', JSON.stringify(upsert, undefined, 2))
 
 				if(upsert.type === 'notify') {
 					for (const msg of upsert.messages) {
-						//TODO: More built-in implementation of this
-						/* if (
-							msg.message?.protocolMessage?.type ===
-							proto.Message.ProtocolMessage.Type.HISTORY_SYNC_NOTIFICATION
-						  ) {
-							const historySyncNotification = getHistoryMsg(msg.message)
-							if (
-							  historySyncNotification?.syncType ==
-							  proto.HistorySync.HistorySyncType.ON_DEMAND
-							) {
-							  const { messages } =
-								await downloadAndProcessHistorySyncNotification(
-								  historySyncNotification,
-								  {}
-								)
-
-								
-								const chatId = onDemandMap.get(
-									historySyncNotification!.peerDataRequestSessionId!
-								)
-								
-								console.log(messages)
-
-							  onDemandMap.delete(
-								historySyncNotification!.peerDataRequestSessionId!
-							  )
-
-							  /*
-								// 50 messages is the limit imposed by whatsapp
-								//TODO: Add ratelimit of 7200 seconds
-								//TODO: Max retries 10
-								const messageId = await sock.fetchMessageHistory(
-									50,
-									oldestMessageKey,
-									oldestMessageTimestamp
-								)
-								onDemandMap.set(messageId, chatId)
-							}
-						  } */
-
+				
 						if (msg.message?.conversation || msg.message?.extendedTextMessage?.text) {
 							const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text
 							if (text == "requestPlaceholder" && !upsert.requestId) {
@@ -215,7 +148,6 @@ const startSock = async() => {
 								console.log('Message received from phone, id=', upsert.requestId, msg)
 							}
 
-							// go to an old chat and send this
 							if (text == "onDemandHistSync") {
 								const messageId = await sock.fetchMessageHistory(50, msg.key, msg.messageTimestamp!) 
 								console.log('requested on-demand sync, id=', messageId)
@@ -232,7 +164,6 @@ const startSock = async() => {
 				}
 			}
 
-			// messages updated like status delivered, message deleted etc.
 			if(events['messages.update']) {
 				console.log(
 					JSON.stringify(events['messages.update'], undefined, 2)
@@ -297,7 +228,6 @@ const startSock = async() => {
 			return msg?.message || undefined
 		}
 
-		// only if store is present
 		return proto.Message.fromObject({})
 	}
 }
